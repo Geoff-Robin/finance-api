@@ -1,21 +1,37 @@
+"""
+This module contains the SQLAlchemy ORM models and enums for the database.
+"""
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import String, Enum, ForeignKey, Numeric, Date, Boolean, DateTime, func
 import enum
 import datetime
 
 class Base(DeclarativeBase):
+    """Base class for all SQLAlchemy ORM models."""
     pass
 
 class UserRole(str, enum.Enum):
+    """Enumeration of user roles within the system."""
     viewer = "viewer"
     analyst = "analyst"
     admin = "admin"
 
 class FinancialType(str, enum.Enum):
+    """Enumeration of financial record types."""
     income = "income"
     expense = "expense"
 
 class User(Base):
+    """
+    User model representing an account in the system.
+
+    Attributes:
+        id (int): Primary key for the user.
+        email (str): Unique email address used for login.
+        hashed_password (str): The securely hashed user password.
+        role (UserRole): The system clearance role of the user.
+        records (list[FinancialRecord]): The financial records owned by the user.
+    """
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
@@ -30,6 +46,21 @@ class User(Base):
     records: Mapped[list["FinancialRecord"]] = relationship(back_populates="user")
 
 class FinancialRecord(Base):
+    """
+    Financial record model for tracking incomes or expenses.
+
+    Attributes:
+        id (int): Primary key for the financial record.
+        user_id (int): Foreign key identifier mapping to the owning user.
+        amount (float): The total monetary value of the record.
+        type (FinancialType): The classification type (income or expense).
+        category (str): The user-defined or system-defined category.
+        date (datetime.date): The date the transaction occurred.
+        notes (str | None): Optional user notes or details.
+        is_deleted (bool): If True, marks this record as soft-deleted.
+        created_at (datetime.datetime): When the record was first inserted.
+        user (User): The back-reference mapped to the User instance.
+    """
     __tablename__ = "financial_records"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
