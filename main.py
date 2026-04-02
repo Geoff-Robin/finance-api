@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import (
     AsyncSession
 )
 from pydantic import BaseModel
-from models import Base, UserRole
+from models import Base
+from schemas import UserCreate, UserLogin
 from user_dal import UserDAL
 from utils import hash_password, verify_password
 from typing import Any
@@ -18,15 +19,6 @@ load_dotenv()
 
 class Settings(BaseModel):
     authjwt_secret_key: str
-
-class UserCreate(BaseModel):
-    email: str
-    password: str
-    role: UserRole = UserRole.viewer
-
-class UserLogin(BaseModel):
-    email: str
-    password: str
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
