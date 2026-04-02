@@ -30,6 +30,7 @@ class User(Base):
         email (str): Unique email address used for login.
         hashed_password (str): The securely hashed user password.
         role (UserRole): The system clearance role of the user.
+        is_active (bool): Whether the user account is active or deactivated.
         records (list[FinancialRecord]): The financial records owned by the user.
     """
     __tablename__ = "users"
@@ -42,6 +43,7 @@ class User(Base):
         default=UserRole.viewer,
         nullable=False
     )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     records: Mapped[list["FinancialRecord"]] = relationship(back_populates="user")
 

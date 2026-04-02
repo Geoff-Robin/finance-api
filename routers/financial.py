@@ -53,7 +53,7 @@ async def list_financial_records(
     offset: int = 0,
     limit: int = 100,
     db: AsyncSession = Depends(get_db),
-    user: Any = Depends(RoleChecker([UserRole.admin, UserRole.analyst, UserRole.viewer]))
+    user: Any = Depends(RoleChecker([UserRole.admin, UserRole.analyst]))
 ):
     """
     Retrieves a paginated list of all active financial records bound to the user.
@@ -90,7 +90,7 @@ async def list_financial_records(
 async def get_financial_summary(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user: Any = Depends(RoleChecker([UserRole.admin, UserRole.analyst]))
+    user: Any = Depends(RoleChecker([UserRole.admin, UserRole.analyst, UserRole.viewer]))
 ):
     """
     Calculates dynamic aggregated totals describing an overarching account state.
@@ -112,7 +112,7 @@ async def get_financial_record(
     request: Request,
     record_id: int,
     db: AsyncSession = Depends(get_db),
-    user: Any = Depends(RoleChecker([UserRole.admin, UserRole.analyst, UserRole.viewer]))
+    user: Any = Depends(RoleChecker([UserRole.admin, UserRole.analyst]))
 ):
     """
     Fetches one unambiguous item entity based exclusively off its system key.

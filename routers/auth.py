@@ -82,6 +82,12 @@ async def login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password"
         )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is inactive"
+        )
         
     access_token = await Authorize.create_access_token(subject=str(user.id))
     return {"access_token": access_token, "user_id": user.id}

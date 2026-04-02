@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from pydantic import BaseModel
 from models import Base
-from routers import auth, financial
+from routers import auth, financial, users
 from dependencies import limiter
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -73,6 +73,7 @@ def get_config() -> Any:
 # Include Routers
 app.include_router(auth.router)
 app.include_router(financial.router)
+app.include_router(users.router)
 
 @app.get("/")
 async def root():
