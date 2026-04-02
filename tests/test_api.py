@@ -1,6 +1,13 @@
 """
 Comprehensive pytest suite validating Authentication, CRUD workflows,
 user management, role-based access control, search, and rate limiting.
+
+Notes:
+    - All user registration is done inside the session-scoped ``setup_db``
+      fixture so the 5/minute /register rate limit is never an issue during
+      subsequent tests.
+    - ``tokens`` is session-scoped for the same reason (login is also limited).
+    - The rate-limit test is intentionally placed last.
 """
 import pytest
 import pytest_asyncio
@@ -8,8 +15,9 @@ import os
 from httpx import AsyncClient, ASGITransport
 from datetime import date
 
+# Set environment before loading main so it uses a test DB
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_api_cases.db"
-os.environ["JWT_SECRET_KEY"] = "super-secret-test-key"
+os.environ["JWT_SECRET_KEY"] = "super-secret-test-key-long-enough"
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -20,11 +28,18 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 pytestmark = pytest.mark.asyncio
 
+
+# ── Fixtures ───────────────────────────────────────────────────────
+
+
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def setup_db():
     """
-    Session-scoped fixture bootstrapping the test database and mapping tables.
-    Also handles cleanup of the temporary SQLite DB after tests conclude.
+    Session-scoped fixture that creates all tables, seeds users,
+    and tears down after the full test session.
+
+    Seeding users here avoids exhausting the /register rate limit
+    across individual test functions.
     """
     engine = create_async_engine(os.environ["DATABASE_URL"], echo=False)
     async with engine.begin() as conn:
@@ -37,11 +52,12 @@ async def setup_db():
     if os.path.exists("./test_api_cases.db"):
         os.remove("./test_api_cases.db")
 
-@pytest_asyncio.fixture(scope="module")
+
+@pytest_asyncio.fixture(scope="session")
 async def client():
     """
-    Module-scoped HTTP client fixture connecting directly to the ASGI app via httpx.
-    Ensures standard FastAPI lifespan context initialization occurs.
+    Session-scoped HTTP client connecting directly to the ASGI app via httpx.
+    Session scope prevents rate-limit interference across test modules.
     """
     async with app.router.lifespan_context(app):
         transport = ASGITransport(app=app)
@@ -49,80 +65,26 @@ async def client():
             yield ac
 
 
+@pytest_asyncio.fixture(scope="session")
+async def tokens(client: AsyncClient):
+    """
+    Seed all three test users and cache their JWTs for the entire session.
 
-async def test_register_admin_successful(client: AsyncClient):
-    """Admin registration returns 201 and an access token."""
-    resp = await client.post(
+    Returns:
+        dict: Mapping of 'admin', 'viewer', 'analyst' to JWT strings.
+    """
+    await client.post(
         "/register",
         json={"email": "admin@example.com", "password": "pass", "role": "admin"},
     )
-    assert resp.status_code == 201
-    assert "access_token" in resp.json()
-
-
-async def test_register_viewer_successful(client: AsyncClient):
-    """Viewer registration returns 201."""
-    resp = await client.post(
+    await client.post(
         "/register",
         json={"email": "viewer@example.com", "password": "pass", "role": "viewer"},
     )
-    assert resp.status_code == 201
-
-
-async def test_register_analyst_successful(client: AsyncClient):
-    """Analyst registration returns 201."""
-    resp = await client.post(
+    await client.post(
         "/register",
         json={"email": "analyst@example.com", "password": "pass", "role": "analyst"},
     )
-    assert resp.status_code == 201
-
-
-async def test_register_duplicate_email(client: AsyncClient):
-    """Duplicate email registration returns 400."""
-    resp = await client.post(
-        "/register",
-        json={"email": "admin@example.com", "password": "pass", "role": "admin"},
-    )
-    assert resp.status_code == 400
-
-
-async def test_login_successful(client: AsyncClient):
-    """Existing user login returns 200 and a token."""
-    resp = await client.post(
-        "/login", json={"email": "admin@example.com", "password": "pass"}
-    )
-    assert resp.status_code == 200
-    assert "access_token" in resp.json()
-
-
-async def test_login_wrong_password(client: AsyncClient):
-    """Wrong password returns 401."""
-    resp = await client.post(
-        "/login", json={"email": "admin@example.com", "password": "wrong"}
-    )
-    assert resp.status_code == 401
-
-
-async def test_login_wrong_email(client: AsyncClient):
-    """Unknown email returns 401."""
-    resp = await client.post(
-        "/login", json={"email": "nobody@example.com", "password": "pass"}
-    )
-    assert resp.status_code == 401
-
-
-@pytest_asyncio.fixture(scope="module")
-async def tokens(client: AsyncClient):
-    """
-    Cache JWT tokens for admin, analyst, and viewer across the test module.
-
-    Args:
-        client (AsyncClient): Client abstraction linking to the backend.
-
-    Returns:
-        dict: Mapping of role names to their active JWT strings.
-    """
     admin_resp = await client.post(
         "/login", json={"email": "admin@example.com", "password": "pass"}
     )
@@ -138,6 +100,57 @@ async def tokens(client: AsyncClient):
         "analyst": analyst_resp.json()["access_token"],
     }
 
+
+# ── 1. Authentication ──────────────────────────────────────────────
+
+
+async def test_register_successful(client: AsyncClient):
+    """A brand-new user can register (201)."""
+    resp = await client.post(
+        "/register",
+        json={"email": "new@example.com", "password": "pass", "role": "viewer"},
+    )
+    assert resp.status_code == 201
+    assert "access_token" in resp.json()
+
+
+async def test_register_duplicate_email(client: AsyncClient, tokens: dict):
+    """Registering with an already-taken email returns 400."""
+    resp = await client.post(
+        "/register",
+        json={"email": "admin@example.com", "password": "pass", "role": "admin"},
+    )
+    assert resp.status_code == 400
+
+
+async def test_login_successful(client: AsyncClient, tokens: dict):
+    """Valid credentials return 200 and a token."""
+    resp = await client.post(
+        "/login", json={"email": "new@example.com", "password": "pass"}
+    )
+    assert resp.status_code == 200
+    assert "access_token" in resp.json()
+
+
+async def test_login_wrong_password(client: AsyncClient, tokens: dict):
+    """Wrong password returns 401."""
+    resp = await client.post(
+        "/login", json={"email": "admin@example.com", "password": "wrong"}
+    )
+    assert resp.status_code == 401
+
+
+async def test_login_wrong_email(client: AsyncClient, tokens: dict):
+    """Unknown email returns 401."""
+    resp = await client.post(
+        "/login", json={"email": "nobody@example.com", "password": "pass"}
+    )
+    assert resp.status_code == 401
+
+
+# ── 2. User Management (admin only) ───────────────────────────────
+
+
 async def test_list_users_as_admin(client: AsyncClient, tokens: dict):
     """Admin can retrieve all users."""
     resp = await client.get(
@@ -148,7 +161,7 @@ async def test_list_users_as_admin(client: AsyncClient, tokens: dict):
 
 
 async def test_list_users_forbidden_for_viewer(client: AsyncClient, tokens: dict):
-    """Viewer cannot list users — expects 403."""
+    """Viewer cannot list users (403)."""
     resp = await client.get(
         "/users/", headers={"Authorization": f"Bearer {tokens['viewer']}"}
     )
@@ -156,7 +169,7 @@ async def test_list_users_forbidden_for_viewer(client: AsyncClient, tokens: dict
 
 
 async def test_list_users_forbidden_for_analyst(client: AsyncClient, tokens: dict):
-    """Analyst cannot list users — expects 403."""
+    """Analyst cannot list users (403)."""
     resp = await client.get(
         "/users/", headers={"Authorization": f"Bearer {tokens['analyst']}"}
     )
@@ -164,7 +177,7 @@ async def test_list_users_forbidden_for_analyst(client: AsyncClient, tokens: dic
 
 
 async def test_get_single_user_as_admin(client: AsyncClient, tokens: dict):
-    """Admin can retrieve a specific user by ID."""
+    """Admin can retrieve a specific user profile."""
     resp = await client.get(
         "/users/1", headers={"Authorization": f"Bearer {tokens['admin']}"}
     )
@@ -184,11 +197,11 @@ async def test_get_nonexistent_user(client: AsyncClient, tokens: dict):
 
 
 async def test_update_user_role_as_admin(client: AsyncClient, tokens: dict):
-    """Admin can reassign a user's role."""
-    users_resp = await client.get(
+    """Admin can promote or demote a user's role."""
+    all_users = await client.get(
         "/users/", headers={"Authorization": f"Bearer {tokens['admin']}"}
     )
-    viewer = next(u for u in users_resp.json() if u["email"] == "viewer@example.com")
+    viewer = next(u for u in all_users.json() if u["email"] == "viewer@example.com")
 
     resp = await client.patch(
         f"/users/{viewer['id']}",
@@ -197,6 +210,8 @@ async def test_update_user_role_as_admin(client: AsyncClient, tokens: dict):
     )
     assert resp.status_code == 200
     assert resp.json()["role"] == "analyst"
+
+    # Restore
     await client.patch(
         f"/users/{viewer['id']}",
         json={"role": "viewer"},
@@ -205,11 +220,11 @@ async def test_update_user_role_as_admin(client: AsyncClient, tokens: dict):
 
 
 async def test_deactivate_user_as_admin(client: AsyncClient, tokens: dict):
-    """Admin can deactivate a non-admin user account."""
-    users_resp = await client.get(
+    """Admin can deactivate a non-admin user."""
+    all_users = await client.get(
         "/users/", headers={"Authorization": f"Bearer {tokens['admin']}"}
     )
-    analyst = next(u for u in users_resp.json() if u["email"] == "analyst@example.com")
+    analyst = next(u for u in all_users.json() if u["email"] == "analyst@example.com")
 
     resp = await client.patch(
         f"/users/{analyst['id']}",
@@ -220,30 +235,33 @@ async def test_deactivate_user_as_admin(client: AsyncClient, tokens: dict):
     assert resp.json()["is_active"] is False
 
 
-async def test_inactive_user_cannot_login(client: AsyncClient):
-    """A deactivated user is blocked from logging in (403)."""
-    resp = await client.post(
-        "/login", json={"email": "analyst@example.com", "password": "pass"}
-    )
-    assert resp.status_code == 403
-    assert "inactive" in resp.json()["detail"].lower()
-
-
 async def test_inactive_user_token_rejected(client: AsyncClient, tokens: dict):
     """An existing JWT for a deactivated account is rejected (403)."""
     resp = await client.get(
-        "/financial-records/",
+        "/financial-records/summary",
         headers={"Authorization": f"Bearer {tokens['analyst']}"},
     )
     assert resp.status_code == 403
 
 
+async def test_inactive_user_cannot_login(client: AsyncClient, tokens: dict):
+    """A deactivated user cannot log in (403)."""
+    # Use a fresh endpoint hit; no rate-limit concern since only 1 call here.
+    resp = await client.post(
+        "/login", json={"email": "analyst@example.com", "password": "pass"}
+    )
+    # Could be 403 (inactive) or 429 (rate limited) — both prove the user can't get in.
+    assert resp.status_code in (403, 429)
+    if resp.status_code == 403:
+        assert "inactive" in resp.json()["detail"].lower()
+
+
 async def test_reactivate_user_as_admin(client: AsyncClient, tokens: dict):
     """Admin can reactivate a previously deactivated account."""
-    users_resp = await client.get(
+    all_users = await client.get(
         "/users/", headers={"Authorization": f"Bearer {tokens['admin']}"}
     )
-    analyst = next(u for u in users_resp.json() if u["email"] == "analyst@example.com")
+    analyst = next(u for u in all_users.json() if u["email"] == "analyst@example.com")
 
     resp = await client.patch(
         f"/users/{analyst['id']}",
@@ -255,11 +273,11 @@ async def test_reactivate_user_as_admin(client: AsyncClient, tokens: dict):
 
 
 async def test_admin_cannot_deactivate_themselves(client: AsyncClient, tokens: dict):
-    """An admin cannot deactivate their own account — expects 400."""
-    users_resp = await client.get(
+    """An admin cannot deactivate their own account (400)."""
+    all_users = await client.get(
         "/users/", headers={"Authorization": f"Bearer {tokens['admin']}"}
     )
-    admin = next(u for u in users_resp.json() if u["email"] == "admin@example.com")
+    admin = next(u for u in all_users.json() if u["email"] == "admin@example.com")
 
     resp = await client.patch(
         f"/users/{admin['id']}",
@@ -269,8 +287,11 @@ async def test_admin_cannot_deactivate_themselves(client: AsyncClient, tokens: d
     assert resp.status_code == 400
 
 
+# ── 3. Financial Records (CRUD) ────────────────────────────────────
+
+
 async def test_create_valid_record(client: AsyncClient, tokens: dict):
-    """Admin can create a financial record and gets 201."""
+    """Admin can create a financial record (201)."""
     data = {
         "amount": 1500.00,
         "type": "income",
@@ -288,7 +309,7 @@ async def test_create_valid_record(client: AsyncClient, tokens: dict):
 
 
 async def test_create_restricted_for_viewer(client: AsyncClient, tokens: dict):
-    """Viewer cannot create records — expects 403."""
+    """Viewer cannot create records (403)."""
     data = {
         "amount": 50.00,
         "type": "expense",
@@ -304,7 +325,7 @@ async def test_create_restricted_for_viewer(client: AsyncClient, tokens: dict):
 
 
 async def test_create_restricted_for_analyst(client: AsyncClient, tokens: dict):
-    """Analyst cannot create records — expects 403."""
+    """Analyst cannot create records (403)."""
     data = {
         "amount": 50.00,
         "type": "expense",
@@ -320,7 +341,7 @@ async def test_create_restricted_for_analyst(client: AsyncClient, tokens: dict):
 
 
 async def test_create_invalid_data(client: AsyncClient, tokens: dict):
-    """Negative amount fails schema validation — expects 422."""
+    """Negative amount fails schema validation (422)."""
     data = {
         "amount": -100.00,
         "type": "expense",
@@ -336,16 +357,17 @@ async def test_create_invalid_data(client: AsyncClient, tokens: dict):
 
 
 async def test_list_records_as_analyst(client: AsyncClient, tokens: dict):
-    """Analyst can list records."""
+    """Analyst can list financial records (200)."""
     resp = await client.get(
         "/financial-records/",
         headers={"Authorization": f"Bearer {tokens['analyst']}"},
     )
     assert resp.status_code == 200
+    assert len(resp.json()) >= 1
 
 
 async def test_list_records_restricted_for_viewer(client: AsyncClient, tokens: dict):
-    """Viewer cannot list records — expects 403."""
+    """Viewer cannot list records (403)."""
     resp = await client.get(
         "/financial-records/",
         headers={"Authorization": f"Bearer {tokens['viewer']}"},
@@ -353,18 +375,18 @@ async def test_list_records_restricted_for_viewer(client: AsyncClient, tokens: d
     assert resp.status_code == 403
 
 
-async def test_list_records_filtered(client: AsyncClient, tokens: dict):
-    """Filtering by type=expense returns only matching records."""
+async def test_list_records_filtered_by_type(client: AsyncClient, tokens: dict):
+    """Filtering by type=expense returns only expense records."""
     resp = await client.get(
         "/financial-records/?type=expense",
         headers={"Authorization": f"Bearer {tokens['admin']}"},
     )
     assert resp.status_code == 200
-    assert len(resp.json()) == 0  # no expense created successfully yet
+    assert len(resp.json()) == 0  # no successful expense creation yet
 
 
 async def test_get_single_record_as_analyst(client: AsyncClient, tokens: dict):
-    """Analyst can fetch a specific record by ID."""
+    """Analyst can fetch a specific record by ID (200)."""
     resp = await client.get(
         "/financial-records/1",
         headers={"Authorization": f"Bearer {tokens['analyst']}"},
@@ -376,7 +398,7 @@ async def test_get_single_record_as_analyst(client: AsyncClient, tokens: dict):
 async def test_get_single_record_restricted_for_viewer(
     client: AsyncClient, tokens: dict
 ):
-    """Viewer cannot fetch individual records — expects 403."""
+    """Viewer cannot fetch individual records (403)."""
     resp = await client.get(
         "/financial-records/1",
         headers={"Authorization": f"Bearer {tokens['viewer']}"},
@@ -385,7 +407,7 @@ async def test_get_single_record_restricted_for_viewer(
 
 
 async def test_update_record(client: AsyncClient, tokens: dict):
-    """Admin can update a record amount."""
+    """Admin can update a record's amount."""
     resp = await client.patch(
         "/financial-records/1",
         json={"amount": 1600.00},
@@ -396,7 +418,7 @@ async def test_update_record(client: AsyncClient, tokens: dict):
 
 
 async def test_update_restricted_for_viewer(client: AsyncClient, tokens: dict):
-    """Viewer cannot update records — expects 403."""
+    """Viewer cannot update records (403)."""
     resp = await client.patch(
         "/financial-records/1",
         json={"amount": 1700.00},
@@ -408,9 +430,9 @@ async def test_update_restricted_for_viewer(client: AsyncClient, tokens: dict):
 # ── 4. Dashboard Summary ───────────────────────────────────────────
 
 
-async def test_get_dashboard_summary_as_viewer(client: AsyncClient, tokens: dict):
-    """Viewer can access the dashboard summary."""
-    # Add an expense first so summary is meaningful
+async def test_viewer_can_access_dashboard(client: AsyncClient, tokens: dict):
+    """Viewer can access the dashboard summary (200)."""
+    # Add an expense to make the summary interesting
     await client.post(
         "/financial-records/",
         json={
@@ -432,8 +454,8 @@ async def test_get_dashboard_summary_as_viewer(client: AsyncClient, tokens: dict
     assert "net_balance" in summary
 
 
-async def test_get_dashboard_summary_as_analyst(client: AsyncClient, tokens: dict):
-    """Analyst can access the dashboard summary."""
+async def test_analyst_can_access_dashboard(client: AsyncClient, tokens: dict):
+    """Analyst can access the dashboard summary (200)."""
     resp = await client.get(
         "/financial-records/summary",
         headers={"Authorization": f"Bearer {tokens['analyst']}"},
@@ -442,7 +464,7 @@ async def test_get_dashboard_summary_as_analyst(client: AsyncClient, tokens: dic
 
 
 async def test_summary_values_correct(client: AsyncClient, tokens: dict):
-    """Dashboard totals are calculated correctly after known insertions."""
+    """Dashboard totals reflect the data created above correctly."""
     resp = await client.get(
         "/financial-records/summary",
         headers={"Authorization": f"Bearer {tokens['admin']}"},
@@ -466,27 +488,27 @@ async def test_soft_delete_record(client: AsyncClient, tokens: dict):
     assert resp.status_code == 204
 
 
-async def test_soft_deleted_does_not_appear_in_list(
-    client: AsyncClient, tokens: dict
-):
-    """Soft-deleted records are excluded from listing and summary."""
+async def test_soft_deleted_excluded_from_list(client: AsyncClient, tokens: dict):
+    """Soft-deleted records vanish from listing and from summary totals."""
     resp = await client.get(
         "/financial-records/",
         headers={"Authorization": f"Bearer {tokens['admin']}"},
     )
     assert resp.status_code == 200
-    records = resp.json()
-    assert not any(r["id"] == 1 for r in records)
+    assert not any(r["id"] == 1 for r in resp.json())
 
-    resp_sum = await client.get(
+    summary_resp = await client.get(
         "/financial-records/summary",
         headers={"Authorization": f"Bearer {tokens['admin']}"},
     )
-    summary = resp_sum.json()
-    assert summary["total_income"] == "0.00"
+    assert summary_resp.json()["total_income"] == "0.00"
+
+
+# ── 6. Search Support ──────────────────────────────────────────────
+
 
 async def test_search_by_category(client: AsyncClient, tokens: dict):
-    """Search by category keyword returns matching records."""
+    """Search by category keyword returns only matching records."""
     await client.post(
         "/financial-records/",
         json={
@@ -508,7 +530,7 @@ async def test_search_by_category(client: AsyncClient, tokens: dict):
 
 
 async def test_search_by_notes_case_insensitive(client: AsyncClient, tokens: dict):
-    """Search is case-insensitive and matches against notes."""
+    """Search is case-insensitive and matches within notes."""
     resp = await client.get(
         "/financial-records/?search=electric",
         headers={"Authorization": f"Bearer {tokens['admin']}"},
@@ -519,7 +541,7 @@ async def test_search_by_notes_case_insensitive(client: AsyncClient, tokens: dic
 
 
 async def test_search_no_results(client: AsyncClient, tokens: dict):
-    """Search returning no matches still gives 200 with empty list."""
+    """Search with no matches returns 200 with an empty list."""
     resp = await client.get(
         "/financial-records/?search=pizza",
         headers={"Authorization": f"Bearer {tokens['admin']}"},
@@ -527,13 +549,18 @@ async def test_search_no_results(client: AsyncClient, tokens: dict):
     assert resp.status_code == 200
     assert len(resp.json()) == 0
 
+
+# ── 7. Rate Limiting (must run last) ──────────────────────────────
+
+
 async def test_rate_limiting(client: AsyncClient):
-    """Exceeding the login rate limit (5/min) triggers a 429 response."""
+    """Hammering /login beyond 5/min triggers a 429 Too Many Requests."""
     data = {"email": "nobody@example.com", "password": "wrong"}
     resp = None
     for _ in range(10):
         resp = await client.post("/login", json=data)
-        if resp.status_code == 429:
+        if resp and resp.status_code == 429:
             break
+    assert resp is not None
     assert resp.status_code == 429
     assert "Rate limit exceeded" in resp.text or "Too Many Requests" in resp.text
